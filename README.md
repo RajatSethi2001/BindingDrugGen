@@ -33,11 +33,14 @@ Install Python libraries with pip:
 pip install -r requirements.txt
 ```
 
-Download BindingDB_All.tsv, which contains information about protein-ligand binding.
+Download BindingDB_All.tsv, which contains information about protein-ligand binding.</br>
 https://www.bindingdb.org/rwd/bind/chemsearch/marvin/Download.jsp
 
-Download CHEMBL 35.
+Download CHEMBL 35.</br>
 https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_35/
+
+If any other data files are missing, see the GitHub Repo and download it from there.</br>
+https://github.com/RajatSethi2001/BindingDrugGen
 
 ## Training Prerequisites
 
