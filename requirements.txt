@@ -1,0 +1,8 @@
+numpy
+pandas
+torch
+selfies
+stable-baselines3
+gymnasium
+scipy
+matplotlib

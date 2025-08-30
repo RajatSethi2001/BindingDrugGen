@@ -1,7 +1,6 @@
 import gymnasium as gym
 import math
 import matplotlib.pyplot as plt
-import mygene
 import numpy as np
 import os
 import pandas as pd
