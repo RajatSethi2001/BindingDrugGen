@@ -1,0 +1,4 @@
+Models/
+Data/BindingDB_All.tsv
+Data/chembl_35_chemreps.txt
+__pycache__/

@@ -1,0 +1,232 @@
+import numpy as np
+import os
+import pandas as pd
+import random
+import selfies as sf
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import Dataset, DataLoader, Subset
+from utils import one_hot_encode, one_hot_decode, set_seeds
+
+class SelfiesEncoder(nn.Module):
+    def __init__(self, selfies_alphabet_len, selfies_chunk_len=10, hidden_size=150, dropout_prob=0.0):
+        super().__init__()
+        self.input_size = selfies_alphabet_len * selfies_chunk_len
+        self.input_layer = nn.Linear(self.input_size, hidden_size)
+
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.bn1 = nn.LayerNorm(hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.bn2 = nn.LayerNorm(hidden_size)
+        
+        self.output_layer = nn.Linear(hidden_size, hidden_size)
+        self.sigmoid = nn.Sigmoid()
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout_prob)
+
+    def forward(self, selfies_one_hot):
+        x = selfies_one_hot.reshape(-1, self.input_size)
+        x = self.input_layer(x)
+        x = self.dropout(self.activation(self.bn1(self.fc1(x))))
+        x = self.dropout(self.activation(self.bn2(self.fc2(x))))
+        output = self.sigmoid(self.output_layer(x))
+        return output
+    
+class SelfiesDecoder(nn.Module):
+    def __init__(self, selfies_alphabet_len, selfies_chunk_len=10, hidden_size=150, dropout_prob=0.0):
+        super().__init__()
+        self.selfies_alphabet_len = selfies_alphabet_len
+        self.selfies_chunk_len = selfies_chunk_len
+        self.output_size = selfies_alphabet_len * selfies_chunk_len
+        
+        self.input_layer = nn.Linear(hidden_size, hidden_size)
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.bn1 = nn.LayerNorm(hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.bn2 = nn.LayerNorm(hidden_size)
+        
+        self.output_layer = nn.Linear(hidden_size, self.output_size)
+        self.sigmoid = nn.Sigmoid()
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout_prob)
+
+    def forward(self, selfies_embedding):
+        x = self.input_layer(selfies_embedding)
+        x = self.dropout(self.activation(self.bn1(self.fc1(x))))
+        x = self.dropout(self.activation(self.bn2(self.fc2(x))))
+        output = self.sigmoid(self.output_layer(x))
+        output = output.view(-1, self.selfies_chunk_len, self.selfies_alphabet_len)
+        return output
+
+class SelfiesDataset(Dataset):
+    def __init__(self, smiles_list, selfies_alphabet, selfies_chunk_len=10):
+        self.selfies_one_hot_list = []
+        for smiles in smiles_list:
+            try:
+                selfies = sf.encoder(smiles)
+                selfies_tokens = list(sf.split_selfies(selfies))
+                selfies_tokens += ["[SKIP]" for _ in range(selfies_chunk_len - len(selfies_tokens) % selfies_chunk_len)]
+                for token_idx in range(0, len(selfies_tokens), selfies_chunk_len):
+                    chunk_tokens = selfies_tokens[token_idx:token_idx + selfies_chunk_len]
+                    selfies_one_hot = one_hot_encode(chunk_tokens, selfies_alphabet)
+                    self.selfies_one_hot_list.append(torch.tensor(selfies_one_hot, dtype=torch.float32))
+            except:
+                pass
+
+    def __len__(self):
+        return len(self.selfies_one_hot_list)
+
+    def __getitem__(self, index):
+        return self.selfies_one_hot_list[index]
+
+def main():
+    set_seeds(2222)
+    train_test_split = 0.2
+    selfies_chunk_len = 10
+    compound_file = "Data/chembl_35_chemreps.txt"
+    nrows = 60000
+    save_dir = "Models"
+
+    batch_size = 128
+    input_noise = 0.0
+
+    hidden_size = 100
+    lr = 5e-4
+    weight_decay = 1e-3
+    lr_limit = 1e-6
+
+    compound_df = pd.read_csv(compound_file, sep="\t", nrows=nrows)
+    smiles_list = compound_df["canonical_smiles"].to_list()
+
+    with open("Data/selfies_alphabet.txt", "r") as f:
+        selfies_alphabet = f.read().splitlines()
+    
+    dataset = SelfiesDataset(smiles_list, selfies_alphabet, selfies_chunk_len=selfies_chunk_len)
+    train_size = int(len(dataset) * (1 - train_test_split))
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    
+    train_indices = indices[:train_size]
+    test_indices = indices[train_size:]
+
+    train_dataset = Subset(dataset, train_indices)
+    test_dataset = Subset(dataset, test_indices)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+    criterion = nn.BCELoss()
+    encoder = SelfiesEncoder(len(selfies_alphabet),
+                            selfies_chunk_len=selfies_chunk_len,
+                            hidden_size=hidden_size)
+    
+    decoder = SelfiesDecoder(len(selfies_alphabet),
+                             selfies_chunk_len=selfies_chunk_len,
+                             hidden_size=hidden_size)
+
+    encoder_optim = optim.AdamW(encoder.parameters(), lr=lr, weight_decay=weight_decay)
+    decoder_optim = optim.AdamW(decoder.parameters(), lr=lr, weight_decay=weight_decay)
+
+    if os.path.exists(f"{save_dir}/selfies_autoencoder.pth"):
+        checkpoint = torch.load(f"{save_dir}/selfies_autoencoder.pth")
+        encoder.load_state_dict(checkpoint["encoder_model"])
+        decoder.load_state_dict(checkpoint["decoder_model"])
+    
+    encoder_lr = lr
+    decoder_lr = lr
+    encode_scheduler = ReduceLROnPlateau(encoder_optim, mode='min', factor=0.5, patience=5, threshold=1e-4)
+    decode_scheduler = ReduceLROnPlateau(decoder_optim, mode='min', factor=0.5, patience=5, threshold=1e-4)
+
+    while encoder_lr > lr_limit:
+        encoder.train()
+        decoder.train()
+        train_loss = 0.0
+        batch_idx = 0
+        for selfies_one_hot in train_loader:
+            noisy_selfies_one_hot = selfies_one_hot + input_noise * torch.randn_like(selfies_one_hot)
+            encoder_optim.zero_grad()
+            decoder_optim.zero_grad()
+            selfies_encoding = encoder(noisy_selfies_one_hot)
+            selfies_decoding = decoder(selfies_encoding)
+            
+            loss = criterion(selfies_decoding, selfies_one_hot)
+            loss.backward()
+            train_loss += loss.item()
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+            encoder_optim.step()
+            decoder_optim.step()
+
+            batch_idx += 1
+            # if batch_idx % 5 == 0:
+            #     print(f"Training Batch Loss = {loss.item()}")
+
+        print("Saving Encoder and Decoder")
+        checkpoint = {
+            "encoder_model": encoder.state_dict(),
+            "decoder_model": decoder.state_dict(),
+            "embedding_dim": hidden_size,
+            "chunk_length": selfies_chunk_len
+        }
+        torch.save(checkpoint, f"{save_dir}/selfies_autoencoder.pth")
+        
+        encoder.eval()
+        decoder.eval()
+        test_loss = 0.0
+        for selfies_one_hot in test_loader:
+            selfies_encoding = encoder(selfies_one_hot)
+            selfies_decoding = decoder(selfies_encoding)
+
+            loss = criterion(selfies_decoding, selfies_one_hot)
+            test_loss += loss.item()
+
+            selfies_probs_np = selfies_decoding.detach().cpu().numpy()
+        
+        correct_selfies = 0
+        total_selfies = 0
+        correct_tokens = 0
+        total_tokens = 0
+        for batch_idx in range(batch_size):
+            selfies_one_hot_og = selfies_one_hot[batch_idx].cpu().numpy()
+            selfies_og_tokens = one_hot_decode(selfies_one_hot_og, selfies_alphabet)
+            selfies_og_tokens_clean = [token for token in selfies_og_tokens if token != "[SKIP]"]
+            selfies_og = "".join(selfies_og_tokens_clean)
+            
+            selfies_one_hot_ae = selfies_probs_np[batch_idx]
+            selfies_ae_tokens = one_hot_decode(selfies_one_hot_ae, selfies_alphabet)
+            selfies_ae_tokens_clean = [token for token in selfies_ae_tokens if token != "[SKIP]"]
+            selfies_ae = "".join(selfies_ae_tokens_clean)
+
+            if selfies_og == selfies_ae:
+                correct_selfies += 1
+            total_selfies += 1
+
+            for token_idx in range(len(selfies_og_tokens)):
+                if selfies_og_tokens[token_idx] == selfies_ae_tokens[token_idx]:
+                    correct_tokens += 1
+                total_tokens += 1
+            
+            try:
+                print(f"SELFIES Before: {selfies_og}")
+                print(f"SELFIES After:  {selfies_ae}")
+                print()
+            except Exception as e:
+                print(f"Decoding failed for: {selfies_og}, Error: {e}")
+            
+        print(f"SELFIES Accuracy = {correct_selfies / total_selfies}")
+        print(f"Token-Wise Accuracy = {correct_tokens / total_tokens}")
+        test_loss = test_loss / (len(test_dataset) // batch_size)
+        print(f"Training Loss = {train_loss / (len(train_dataset) // batch_size)}")
+        print(f"Testing Loss = {test_loss}")
+        encode_scheduler.step(test_loss)
+        decode_scheduler.step(test_loss)
+
+        encoder_lr = encoder_optim.param_groups[0]['lr']
+        decoder_lr = decoder_optim.param_groups[0]['lr']
+        print(f"Encoder LR = {encoder_lr}, Decoder LR = {decoder_lr}")
+
+if __name__=="__main__":
+    main()
